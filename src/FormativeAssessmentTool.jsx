@@ -6,7 +6,13 @@ import {
   ChevronLeft, ChevronRight, Trash2, Pencil, Check, X, Eye, EyeOff,
   FileSpreadsheet, LogOut, Cloud, CheckSquare, ToggleLeft, Crosshair,
   Type, AlignLeft, ListChecks, CircleDot, ImagePlus, BarChart3, Sparkles,
+  Radio, Link2, QrCode, Copy, Share2, LogIn, AlertTriangle, ArrowRight,
 } from "lucide-react";
+import { QRCodeSVG } from "qrcode.react";
+import { db } from "./firebaseConfig.js";
+import {
+  doc, collection, setDoc, updateDoc, onSnapshot, getDocs, writeBatch,
+} from "firebase/firestore";
 
 /* ============================== Constants ============================== */
 
@@ -253,7 +259,7 @@ function questionFromCsvRow(row) {
 
 /* ============================== Root ============================== */
 
-export default function App() {
+function LegacyApp() {
   const [role, setRole] = useState("home"); // home | teacher | student
   const [questions, setQuestions] = useState(seedQuestions);
   const [students, setStudents] = useState([]);
@@ -1322,6 +1328,462 @@ function renderBlanks(text, blanks, setBlanks, disabled) {
 
 /* ============================== Styles ============================== */
 
+/* ============================== Realtime layer (Firestore) ============================== */
+
+const CODE_CHARS = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+const makeCode = (n = 4) => Array.from({ length: n }, () => CODE_CHARS[Math.floor(Math.random() * CODE_CHARS.length)]).join("");
+const sanitize = (x) => JSON.parse(JSON.stringify(x === undefined ? null : x));
+const joinUrl = (code) => {
+  const { origin, pathname } = window.location;
+  return `${origin}${pathname}#join-${code}`;
+};
+function parseHash() {
+  const h = (typeof window !== "undefined" ? window.location.hash : "").replace(/^#/, "");
+  const m = h.match(/^join-([A-Za-z0-9]+)/i);
+  if (m) return { mode: "join", code: m[1].toUpperCase() };
+  if (/^join/i.test(h)) return { mode: "join", code: null };
+  return { mode: "host" };
+}
+function saveMe(code, m) { try { localStorage.setItem("pulsecheck:" + code, JSON.stringify(m)); } catch (e) {} }
+function loadMe(code) { try { const s = localStorage.getItem("pulsecheck:" + code); return s ? JSON.parse(s) : null; } catch (e) { return null; } }
+
+// ---- Firestore writes ----
+async function fbCreateRoom(code, questions, hostId) {
+  const batch = writeBatch(db);
+  batch.set(doc(db, "rooms", code), { phase: "lobby", activeIndex: 0, questionCount: questions.length, revealed: {}, hostId, createdAt: Date.now() });
+  questions.forEach((q, i) => batch.set(doc(db, "rooms", code, "questions", String(i)), { ...sanitize(q), _i: i }));
+  await batch.commit();
+}
+async function fbSyncQuestions(code, questions) {
+  const batch = writeBatch(db);
+  batch.update(doc(db, "rooms", code), { questionCount: questions.length });
+  questions.forEach((q, i) => batch.set(doc(db, "rooms", code, "questions", String(i)), { ...sanitize(q), _i: i }));
+  await batch.commit();
+}
+const fbSetMeta = (code, patch) => updateDoc(doc(db, "rooms", code), patch);
+const fbJoin = (code, sid, s) => setDoc(doc(db, "rooms", code, "students", sid), { name: s.name, avatar: s.avatar, joinedAt: Date.now() });
+const fbSubmit = (code, sid, qid, answer, correct) =>
+  setDoc(doc(db, "rooms", code, "responses", sid), { [qid]: { answer: sanitize(answer), correct: correct === null || correct === undefined ? "ungraded" : correct } }, { merge: true });
+async function fbGetQuestions(code) {
+  const snap = await getDocs(collection(db, "rooms", code, "questions"));
+  const arr = [];
+  snap.forEach((d) => { const v = d.data(); arr[v._i ?? arr.length] = v; });
+  return arr.filter(Boolean);
+}
+
+// ---- Firestore subscriptions ----
+function useMeta(code) {
+  const [meta, setMeta] = useState({ loading: true, exists: true });
+  useEffect(() => {
+    if (!db || !code) { setMeta({ loading: false, exists: false }); return; }
+    setMeta({ loading: true, exists: true });
+    return onSnapshot(doc(db, "rooms", code),
+      (snap) => snap.exists() ? setMeta({ loading: false, exists: true, ...snap.data() }) : setMeta({ loading: false, exists: false }),
+      () => setMeta({ loading: false, exists: false }));
+  }, [code]);
+  return meta;
+}
+function useStudents(code) {
+  const [list, setList] = useState([]);
+  useEffect(() => {
+    if (!db || !code) { setList([]); return; }
+    return onSnapshot(collection(db, "rooms", code, "students"), (snap) => {
+      const a = []; snap.forEach((d) => a.push({ id: d.id, ...d.data() }));
+      a.sort((x, y) => (x.joinedAt || 0) - (y.joinedAt || 0));
+      setList(a);
+    });
+  }, [code]);
+  return list;
+}
+function useResponses(code) {
+  const [list, setList] = useState([]);
+  useEffect(() => {
+    if (!db || !code) { setList([]); return; }
+    return onSnapshot(collection(db, "rooms", code, "responses"), (snap) => {
+      const out = [];
+      snap.forEach((d) => {
+        const sid = d.id, data = d.data();
+        Object.entries(data).forEach(([qid, v]) => out.push({ sid, qid, answer: v.answer, correct: v.correct === "ungraded" ? null : v.correct }));
+      });
+      setList(out);
+    });
+  }, [code]);
+  return list;
+}
+
+function useToast() {
+  const [t, setT] = useState(null);
+  const ref = useRef();
+  const show = useCallback((m) => { setT(m); clearTimeout(ref.current); ref.current = setTimeout(() => setT(null), 2600); }, []);
+  return [t, show];
+}
+const Toast = ({ t }) => (t ? <div className="fa-toast" role="status">{t}</div> : null);
+
+/* ============================== Root router ============================== */
+
+export default function App() {
+  const [route, setRoute] = useState(() => parseHash());
+  useEffect(() => {
+    const on = () => setRoute(parseHash());
+    window.addEventListener("hashchange", on);
+    return () => window.removeEventListener("hashchange", on);
+  }, []);
+  if (!db) return <div className="fa-root"><Styles /><SetupNotice /></div>;
+  return route.mode === "join" ? <JoinApp initialCode={route.code} /> : <HostApp />;
+}
+
+function SetupNotice() {
+  return (
+    <div className="fa-setup">
+      <div className="fa-setup-card">
+        <div className="fa-setup-ic"><AlertTriangle size={26} /></div>
+        <h2>One quick step: connect Firebase</h2>
+        <p>Your app is ready, but it needs a free Firebase project so students on other devices can join.
+          Open <code>src/firebaseConfig.js</code> and paste your project&apos;s config where shown. Full
+          step-by-step instructions are in the <b>README.md</b> that came in the zip.</p>
+        <p className="fa-setup-small">Until then, everything else works — you just won&apos;t get live join links.</p>
+      </div>
+    </div>
+  );
+}
+
+/* ============================== Host (teacher) ============================== */
+
+function HostApp() {
+  const [questions, setQuestions] = useState(seedQuestions);
+  const [roomCode, setRoomCode] = useState(null);
+  const [tab, setTab] = useState("build");
+  const [toast, show] = useToast();
+  const hostId = useMemo(() => uid(), []);
+
+  const meta = useMeta(roomCode);
+  const students = useStudents(roomCode);
+  const responses = useResponses(roomCode);
+
+  useEffect(() => {
+    if (db && roomCode) fbSyncQuestions(roomCode, questions).catch(() => show("Question sync failed"));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [questions, roomCode]);
+
+  const createRoom = async () => {
+    if (questions.length === 0) return show("Add at least one question first.");
+    const code = makeCode(4);
+    try { await fbCreateRoom(code, questions, hostId); setRoomCode(code); setTab("present"); show("Room " + code + " is live"); }
+    catch (e) { console.error(e); show("Could not create room — check your Firebase setup."); }
+  };
+  const startQuiz = () => fbSetMeta(roomCode, { activeIndex: 0, phase: "running" }).catch(() => {});
+  const endQuiz = () => fbSetMeta(roomCode, { phase: "lobby" }).catch(() => {});
+  const setActive = (i) => fbSetMeta(roomCode, { activeIndex: i }).catch(() => {});
+  const setReveal = (qid, v) => fbSetMeta(roomCode, { ["revealed." + qid]: v }).catch(() => {});
+
+  return (
+    <div className="fa-root">
+      <Styles />
+      <header className="fa-header">
+        <div className="fa-brand">
+          <div className="fa-logo"><Sparkles size={18} /></div>
+          <div>
+            <div className="fa-brand-name">PulseCheck</div>
+            <div className="fa-brand-sub">Teacher studio</div>
+          </div>
+        </div>
+        <nav className="fa-seg" role="tablist">
+          <button className={`fa-seg-btn ${tab === "build" ? "on" : ""}`} onClick={() => setTab("build")}><Pencil size={15} /> Build</button>
+          <button className={`fa-seg-btn ${tab === "present" ? "on" : ""}`} onClick={() => setTab("present")}><Play size={15} /> Present</button>
+          <button className={`fa-seg-btn ${tab === "report" ? "on" : ""}`} onClick={() => setTab("report")}><BarChart3 size={15} /> Report</button>
+        </nav>
+      </header>
+      <main className="fa-main">
+        {tab === "build" && <BuildTab questions={questions} setQuestions={setQuestions} showToast={show} />}
+        {tab === "present" && (
+          <HostPresent
+            questions={questions} roomCode={roomCode} meta={meta} students={students} responses={responses}
+            onCreate={createRoom} onStart={startQuiz} onEnd={endQuiz} setActive={setActive} setReveal={setReveal}
+          />
+        )}
+        {tab === "report" && <ReportTab questions={questions} students={students} responses={responses} showToast={show} />}
+      </main>
+      <Toast t={toast} />
+    </div>
+  );
+}
+
+function GoLivePanel({ questions, onCreate }) {
+  return (
+    <div className="fa-golive">
+      <div className="fa-golive-ic"><Radio size={30} /></div>
+      <h2>Go live</h2>
+      <p>Create a room to get a join link, a room code, and a QR code your students can use from their own phones.</p>
+      <button className="fa-btn fa-btn-primary fa-golive-btn" onClick={onCreate} disabled={questions.length === 0}>
+        <Radio size={17} /> Create room &amp; get join link
+      </button>
+      <div className="fa-golive-note">{questions.length} question{questions.length !== 1 ? "s" : ""} ready to send</div>
+    </div>
+  );
+}
+
+function ShareBlock({ code, compact }) {
+  const url = joinUrl(code);
+  const [copied, setCopied] = useState(false);
+  const copy = () => {
+    try { navigator.clipboard.writeText(url); setCopied(true); setTimeout(() => setCopied(false), 1500); } catch (e) {}
+  };
+  const share = () => { try { if (navigator.share) navigator.share({ title: "Join my PulseCheck quiz", url }); } catch (e) {} };
+  return (
+    <div className={`fa-share ${compact ? "compact" : ""}`}>
+      <div className="fa-share-main">
+        <div className="fa-share-code">
+          <span>Room code</span>
+          <b>{code}</b>
+        </div>
+        <div className="fa-share-links">
+          <div className="fa-share-linkrow">
+            <Link2 size={15} />
+            <input readOnly value={url} onFocus={(e) => e.target.select()} />
+          </div>
+          <div className="fa-share-btns">
+            <button className="fa-btn fa-btn-soft fa-btn-sm" onClick={copy}><Copy size={13} /> {copied ? "Copied!" : "Copy link"}</button>
+            {typeof navigator !== "undefined" && navigator.share && (
+              <button className="fa-btn fa-btn-soft fa-btn-sm" onClick={share}><Share2 size={13} /> Share</button>
+            )}
+          </div>
+        </div>
+      </div>
+      {!compact && (
+        <div className="fa-share-qr">
+          <div className="fa-qr-box"><QRCodeSVG value={url} size={128} bgColor="transparent" fgColor="#181735" /></div>
+          <span><QrCode size={12} /> Scan to join</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function HostPresent({ questions, roomCode, meta, students, responses, onCreate, onStart, onEnd, setActive, setReveal }) {
+  if (!roomCode) return <GoLivePanel questions={questions} onCreate={onCreate} />;
+  if (meta.loading) return <div className="fa-empty-big">Connecting to room…</div>;
+
+  const phase = meta.phase || "lobby";
+  const activeIndex = meta.activeIndex || 0;
+  const revealed = meta.revealed || {};
+
+  if (phase === "lobby") {
+    return (
+      <div className="fa-lobby">
+        <div className="fa-lobby-eyebrow">Waiting room · live</div>
+        <h2 className="fa-lobby-title">{students.length === 0 ? "Share the link — waiting for players…" : `${students.length} player${students.length > 1 ? "s" : ""} ready`}</h2>
+        <ShareBlock code={roomCode} />
+        <div className="fa-lobby-stage">
+          {students.length === 0 ? (
+            <div className="fa-lobby-empty"><span className="fa-lobby-empty-emoji">🎬</span><p>No one has joined yet.</p></div>
+          ) : (
+            <div className="fa-dancers">
+              {students.map((s, i) => (
+                <div key={s.id} className="fa-dancer" style={{ animationDelay: `${(i % 8) * 0.12}s` }}>
+                  <span className="fa-dancer-av">{avatarOf(s.avatar).emoji}</span>
+                  <span className="fa-dancer-name">{s.name}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+        <div className="fa-lobby-foot">
+          <div className="fa-lobby-count"><b>{students.length}</b><span>student{students.length !== 1 ? "s" : ""} joined</span></div>
+          <button className="fa-btn fa-btn-primary fa-lobby-start" onClick={onStart} disabled={students.length === 0}>
+            <Play size={18} /> Start quiz
+          </button>
+          <div className="fa-lobby-qcount">{questions.length} question{questions.length !== 1 ? "s" : ""} loaded</div>
+        </div>
+      </div>
+    );
+  }
+
+  const q = questions[activeIndex] || questions[questions.length - 1];
+  const qResponses = responses.filter((r) => r.qid === q.id);
+  const isRevealed = !!revealed[q.id];
+  const isLast = activeIndex === questions.length - 1;
+
+  return (
+    <div className="fa-present">
+      <div className="fa-present-bar">
+        <div className="fa-navdots">
+          {questions.map((qq, i) => <button key={qq.id} className={`fa-dot ${i === activeIndex ? "on" : ""}`} onClick={() => setActive(i)} title={`Q${i + 1}`} />)}
+        </div>
+        <div className="fa-present-actions">
+          <span className="fa-roster-pill"><Radio size={13} /> {roomCode}</span>
+          <span className="fa-roster-pill"><Users size={13} /> {students.length}</span>
+          <button className="fa-btn fa-btn-sm fa-btn-danger" onClick={onEnd}><Square size={14} /> End</button>
+        </div>
+      </div>
+
+      <div className="fa-stage">
+        <div className="fa-stage-head">
+          <span className="fa-badge"><b>Q{activeIndex + 1}</b> {TYPES[q.type].label}</span>
+          <div className="fa-stage-meta">
+            <span className="fa-livedot on" />Live
+            <span className="fa-respcount"><Users size={13} /> {qResponses.length} / {students.length} responded</span>
+          </div>
+        </div>
+        <h2 className="fa-stage-q"><MathText text={q.text || "Untitled question"} /></h2>
+        {TYPES[q.type].graded && (
+          <label className="fa-reveal">
+            <input type="checkbox" checked={isRevealed} onChange={(e) => setReveal(q.id, e.target.checked)} />
+            {isRevealed ? <Eye size={15} /> : <EyeOff size={15} />} Show correct answer
+          </label>
+        )}
+        {TYPES[q.type].graded && <CorrectnessHistogram responses={qResponses} total={students.length} />}
+        <LiveAggregate q={q} responses={qResponses} revealed={isRevealed} students={students} />
+      </div>
+
+      <div className="fa-present-foot">
+        <button className="fa-btn fa-btn-ghost fa-btn-sm" onClick={() => setActive(Math.max(0, activeIndex - 1))} disabled={activeIndex === 0}><ChevronLeft size={15} /> Previous</button>
+        <span className="fa-present-progress">{activeIndex + 1} / {questions.length}</span>
+        {isLast ? (
+          <button className="fa-btn fa-btn-primary fa-btn-sm" onClick={onEnd}>Finish <Check size={15} /></button>
+        ) : (
+          <button className="fa-btn fa-btn-primary fa-btn-sm" onClick={() => setActive(activeIndex + 1)}>Next question <ChevronRight size={15} /></button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ============================== Join (student) ============================== */
+
+function JoinApp({ initialCode }) {
+  const [code, setCode] = useState((initialCode || "").toUpperCase());
+  const [me, setMe] = useState(null);
+  const [questions, setQuestions] = useState(null);
+  const [myResp, setMyResp] = useState({});
+  const [toast, show] = useToast();
+
+  const meta = useMeta(code);
+
+  useEffect(() => { setMe(code ? loadMe(code) : null); }, [code]);
+  useEffect(() => {
+    if (db && code) fbGetQuestions(code).then(setQuestions).catch(() => {});
+  }, [code]);
+
+  const goToCode = (c) => { const cc = c.toUpperCase(); window.location.hash = "join-" + cc; setCode(cc); };
+  const leave = () => { saveMe(code, null); try { localStorage.removeItem("pulsecheck:" + code); } catch (e) {} setMe(null); };
+
+  if (!db) return <div className="fa-root"><Styles /><SetupNotice /></div>;
+
+  if (!code) {
+    return <div className="fa-root"><Styles /><main className="fa-main"><JoinCodeEntry onSubmit={goToCode} /></main><Toast t={toast} /></div>;
+  }
+  if (meta.loading) {
+    return <div className="fa-root"><Styles /><main className="fa-main"><div className="fa-empty-big">Connecting…</div></main></div>;
+  }
+  if (!meta.exists) {
+    return <div className="fa-root"><Styles /><main className="fa-main"><JoinCodeEntry error={`No live quiz found for code “${code}”.`} onSubmit={goToCode} /></main></div>;
+  }
+  if (!me) {
+    return (
+      <div className="fa-root"><Styles /><main className="fa-main">
+        <StudentJoinForm code={code} onJoined={(m) => { saveMe(code, m); setMe(m); }} show={show} />
+      </main><Toast t={toast} /></div>
+    );
+  }
+
+  const phase = meta.phase || "lobby";
+  const activeIndex = meta.activeIndex || 0;
+  const revealed = meta.revealed || {};
+  const av = avatarOf(me.avatar);
+  const q = questions && questions[activeIndex];
+
+  const submit = (answer) => {
+    if (!q) return;
+    const correct = gradeResponse(q, answer);
+    fbSubmit(code, me.sid, q.id, answer, correct)
+      .then(() => { setMyResp((p) => ({ ...p, [q.id]: { answer, correct } })); show("Answer sent!"); })
+      .catch(() => show("Send failed — check your connection."));
+  };
+
+  return (
+    <div className="fa-root"><Styles />
+      <main className="fa-main">
+        <div className="fa-student">
+          <div className="fa-student-bar">
+            <div className="fa-me"><span className="fa-me-av">{av.emoji}</span><b>{me.name}</b><span className="fa-me-room">· {code}</span></div>
+            <button className="fa-btn fa-btn-link fa-btn-sm" onClick={leave}><LogOut size={14} /> Leave</button>
+          </div>
+          {phase !== "running" ? (
+            <div className="fa-wait">
+              <div className="fa-wait-emoji fa-dance">{av.emoji}</div>
+              <h2>You&apos;re in, {me.name}!</h2>
+              <p>Hang tight — your teacher will start the quiz once everyone has joined.</p>
+            </div>
+          ) : !q ? (
+            <div className="fa-wait"><p>Loading question…</p></div>
+          ) : (
+            <StudentAnswer key={q.id} q={q} existing={myResp[q.id]} revealed={!!revealed[q.id]} index={activeIndex} onSubmit={submit} />
+          )}
+        </div>
+      </main>
+      <Toast t={toast} />
+    </div>
+  );
+}
+
+function JoinCodeEntry({ onSubmit, error }) {
+  const [code, setCode] = useState("");
+  const go = () => { if (code.trim()) onSubmit(code.trim()); };
+  return (
+    <div className="fa-login">
+      <div className="fa-login-card">
+        <div className="fa-login-emoji"><LogIn size={44} /></div>
+        <h2>Join a quiz</h2>
+        {error && <div className="fa-join-error"><AlertTriangle size={14} /> {error}</div>}
+        <label className="fa-field">
+          <span>Enter the room code</span>
+          <input className="fa-code-input" value={code} placeholder="e.g. 4KQP" maxLength={8}
+            onChange={(e) => setCode(e.target.value.toUpperCase())} onKeyDown={(e) => e.key === "Enter" && go()} autoFocus />
+        </label>
+        <button className="fa-btn fa-btn-primary fa-btn-block" onClick={go} disabled={!code.trim()}>
+          Continue <ArrowRight size={16} />
+        </button>
+        <p className="fa-join-hint">Your teacher will show the code, a link, or a QR code to scan.</p>
+      </div>
+    </div>
+  );
+}
+
+function StudentJoinForm({ code, onJoined, show }) {
+  const [name, setName] = useState("");
+  const [avatar, setAvatar] = useState("giraffe");
+  const [busy, setBusy] = useState(false);
+  const join = async () => {
+    const clean = name.trim();
+    if (!clean) return;
+    setBusy(true);
+    const sid = uid();
+    try { await fbJoin(code, sid, { name: clean, avatar }); onJoined({ sid, name: clean, avatar }); }
+    catch (e) { setBusy(false); show("Could not join — please try again."); }
+  };
+  return (
+    <div className="fa-login">
+      <div className="fa-login-card">
+        <div className="fa-login-emoji">{avatarOf(avatar).emoji}</div>
+        <h2>Joining room {code}</h2>
+        <label className="fa-field">
+          <span>Your name</span>
+          <input value={name} placeholder="Type your name" onChange={(e) => setName(e.target.value)} onKeyDown={(e) => e.key === "Enter" && join()} autoFocus />
+        </label>
+        <div className="fa-field-label">Pick your animal</div>
+        <div className="fa-avatars">
+          {AVATARS.map((a) => (
+            <button key={a.id} className={`fa-avatar ${avatar === a.id ? "on" : ""}`} onClick={() => setAvatar(a.id)} title={a.name}><span>{a.emoji}</span></button>
+          ))}
+        </div>
+        <button className="fa-btn fa-btn-primary fa-btn-block" onClick={join} disabled={!name.trim() || busy}>
+          {busy ? "Joining…" : `Join as ${avatarOf(avatar).name}`}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function Styles() {
   return (
     <style>{`
@@ -1664,6 +2126,52 @@ function Styles() {
     .fa-histo-bar.pending{background:linear-gradient(180deg,#c9cbe0,#a9abc9)}
     .fa-histo-label{margin-top:9px; font-size:13px; font-weight:600; color:var(--ink2)}
 
+    /* Setup notice */
+    .fa-setup{max-width:640px; margin:60px auto; padding:0 20px}
+    .fa-setup-card{background:#fff; border:1px solid var(--line); border-radius:20px; padding:34px; text-align:center; box-shadow:0 16px 50px rgba(24,23,53,.08)}
+    .fa-setup-ic{width:56px; height:56px; margin:0 auto 14px; border-radius:15px; background:var(--amber-soft); color:var(--amber); display:grid; place-items:center}
+    .fa-setup-card h2{font-size:22px; margin-bottom:12px}
+    .fa-setup-card p{color:var(--ink2); font-size:14.5px; line-height:1.6; margin:0 auto 10px; max-width:460px}
+    .fa-setup-small{color:var(--muted); font-size:13px}
+    .fa-setup-card code{font-family:'Space Mono',monospace; background:var(--canvas); padding:2px 6px; border-radius:6px; font-size:.9em}
+
+    /* Go live */
+    .fa-golive{max-width:520px; margin:40px auto; background:#fff; border:1px solid var(--line); border-radius:22px; padding:40px; text-align:center; box-shadow:0 12px 40px rgba(24,23,53,.06)}
+    .fa-golive-ic{width:64px; height:64px; margin:0 auto 16px; border-radius:17px; background:linear-gradient(135deg,var(--brand),var(--brand-2)); color:#fff; display:grid; place-items:center; box-shadow:0 8px 20px rgba(91,79,233,.35)}
+    .fa-golive h2{font-size:26px; margin-bottom:10px}
+    .fa-golive p{color:var(--muted); font-size:15px; margin-bottom:24px; line-height:1.55}
+    .fa-golive-btn{font-size:16px; padding:15px 28px}
+    .fa-golive-note{font-size:12.5px; color:var(--muted); margin-top:14px}
+
+    /* Share block */
+    .fa-share{display:flex; gap:26px; align-items:center; justify-content:space-between; background:#fff; border:1px solid var(--line); border-radius:18px; padding:20px 22px; margin:0 auto 22px; max-width:720px; box-shadow:0 8px 26px rgba(24,23,53,.06)}
+    .fa-share.compact{padding:14px 16px}
+    .fa-share-main{flex:1; display:flex; flex-direction:column; gap:14px; text-align:left}
+    .fa-share-code{display:flex; flex-direction:column; gap:2px}
+    .fa-share-code span{font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:.1em; color:var(--muted)}
+    .fa-share-code b{font-family:'Bricolage Grotesque'; font-size:40px; line-height:1; letter-spacing:.14em; color:var(--brand)}
+    .fa-share-linkrow{display:flex; align-items:center; gap:8px; border:1px solid var(--line); border-radius:10px; padding:8px 11px; color:var(--muted); background:var(--canvas)}
+    .fa-share-linkrow input{flex:1; border:0; background:transparent; font-size:13px; color:var(--ink2); font-family:'Space Mono',monospace}
+    .fa-share-linkrow input:focus{outline:none}
+    .fa-share-btns{display:flex; gap:8px}
+    .fa-share-qr{display:flex; flex-direction:column; align-items:center; gap:7px}
+    .fa-qr-box{background:#fff; border:1px solid var(--line); border-radius:14px; padding:10px; line-height:0}
+    .fa-share-qr span{font-size:11.5px; color:var(--muted); font-weight:600; display:inline-flex; align-items:center; gap:4px}
+
+    .fa-me-room{color:var(--muted); font-weight:500; font-size:13px}
+
+    /* Join / code entry */
+    .fa-join-error{display:flex; align-items:center; gap:7px; background:var(--wrong-soft); color:var(--wrong); font-size:13px; font-weight:600; padding:9px 13px; border-radius:10px; margin-bottom:16px; text-align:left}
+    .fa-join-hint{font-size:12.5px; color:var(--muted); margin-top:14px}
+    .fa-code-input{text-align:center; font-family:'Bricolage Grotesque',sans-serif !important; font-size:30px !important; font-weight:700; letter-spacing:.3em; text-transform:uppercase}
+    .fa-login-emoji svg{color:var(--brand)}
+
+    @media (max-width:720px){
+      .fa-share{flex-direction:column-reverse; align-items:stretch}
+      .fa-share-main{text-align:center}
+      .fa-share-code{align-items:center}
+      .fa-share-qr{align-self:center}
+    }
     @media (max-width:860px){
       .fa-build{grid-template-columns:1fr}
       .fa-build-list{position:static}
