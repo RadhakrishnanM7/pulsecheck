@@ -13,7 +13,7 @@ export const firebaseConfig = {
   projectId: "pulsecheck-d7d4d",
   storageBucket: "pulsecheck-d7d4d.firebasestorage.app",
   messagingSenderId: "1051167812921",
-  appId: "1:1051167812921:web:1672fc9497f9670ef18ce8",
+  appId: "1:1051167812921:web:1672fc9497f9670ef18ce8"
 };
 
 const isConfigured = !String(firebaseConfig.apiKey).startsWith(
@@ -22,6 +22,6 @@ const isConfigured = !String(firebaseConfig.apiKey).startsWith(
   projectId: "pulsecheck-d7d4d",
   storageBucket: "pulsecheck-d7d4d.firebasestorage.app",
   messagingSenderId: "1051167812921",
-  appId: "1:1051167812921:web:1672fc9497f9670ef18ce8",);
+  appId: "1:1051167812921:web:1672fc9497f9670ef18ce8");
 export const app = isConfigured ? initializeApp(firebaseConfig) : null;
 export const db = app ? getFirestore(app) : null;
